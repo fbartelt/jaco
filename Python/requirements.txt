@@ -1,4 +1,4 @@
 scipy
 numpy
-dqrobotics>=>=1.2.3.dev0
+dqrobotics>=1.2.3.dev0
 quadprog-wheel
