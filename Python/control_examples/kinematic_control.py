@@ -1,3 +1,4 @@
+#%%
 '''
 Contributors:
 - Juan Jose Quiroz Omana (juanjqo@g.ecc.u-tokyo.ac.jp)
@@ -11,15 +12,18 @@ from dqrobotics import *
 from dqrobotics.interfaces.vrep  import DQ_VrepInterface
 from dqrobotics.robot_control import ControlObjective
 from dqrobotics.robot_control import DQ_PseudoinverseController
-from robots.JacoRobot import JacoRobot
+from JacoRobot import JacoRobot
 import time
 from numpy import linalg as LA
-
-
-vi = DQ_VrepInterface()
+import pickle
 
 ## Always use a try-catch in case the connection with V-REP is lost
 ## otherwise your clientid will be locked for future use
+#%%
+
+vi = DQ_VrepInterface()
+qdot_list = []
+
 try:
     ## Connects to the localhost in port 19997 with timeout 100ms and 10 retries for each method call
     vi.connect(19997, 100, 10)
@@ -49,6 +53,7 @@ try:
         q = vi.get_joint_positions(jointnames)
         vi.set_object_pose("x", robot.fkm(q))
         u = controller.compute_setpoint_control_signal(q, vec4(xdesired.translation()))
+        qdot_list.append(u)
         print("error: ", LA.norm(controller.get_last_error_signal()))
         print("Iteration: ", i)
         print("Is stable?: ", controller.system_reached_stable_region())
@@ -69,3 +74,12 @@ except Exception as exp:
     print(
         "There was an error connecting to CoppeliaSim.")
     vi.disconnect_all()
+
+t = translation(xdesired)
+r = P(xdesired)
+translation_quaternion = [float(t.q[1]), float(t.q[2]), float(t.q[3])]
+rotation_quaternion = [float(r.q[1]), float(r.q[2]), float(r.q[3]), float(r.q[0])]
+
+with open('inputs.pickle', 'wb') as f:
+    pickle.dump(qdot_list, f, protocol=pickle.HIGHEST_PROTOCOL)
+# %%
