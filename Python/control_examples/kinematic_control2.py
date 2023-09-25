@@ -12,6 +12,9 @@ from uaibot.robot import Robot
 from uaibot.robot.links import Link
 from uaibot.graphics.model3d import Model3D
 from uaibot.utils import Utils
+from uaibot.simulation import Simulation
+from simobjects.frame import Frame
+from create_uaibot_jaco import create_jaco
 import pickle
 
 solvers.options['show_progress'] = False
@@ -114,7 +117,7 @@ class CoppeliaInterface:
 
     #     return links_info
     
-    def create_uaibot_robot(self):
+    def OLD_create_uaibot_robot(self):
         link_info = self._get_dh()
         n = link_info.shape[1]
         links = []
@@ -126,6 +129,9 @@ class CoppeliaInterface:
         
         rob = Robot(name='jaco', links=links, list_base_3d_obj=dummy)
         return rob
+    
+    def create_uaibot_robot(self):
+        return create_jaco()
     
     def get_target_htm(self, target_path='/xd'):
         target_handle = self.sim.getObject(target_path)
@@ -148,94 +154,116 @@ rotation_quaternion = [0, -8.38e-6, 0, 1]
 
 #%%
 sim = CoppeliaInterface()
-htms = sim._get_htms2()
 # print(sim._get_dh().T)
-# rob = sim.create_uaibot_robot()
-dt = sim.sim.getSimulationTimeStep()/2
+rob = sim.create_uaibot_robot()
+dt = sim.sim.getSimulationTimeStep()
 
 #%%
 """ TESTE NOVO"""
-time_max = 2
+time_max = 10
 eps = 0.05
 imax = round(time_max / dt)
 
-def task_func(htm_des, q=None, htm=None):
-    p_des = htm_des[0:3, 3]
-    x_des = htm_des[0:3, 0]
-    y_des = htm_des[0:3, 1]
-    z_des = htm_des[0:3, 2]
-
-    jac_eef, htm_eef = self.jac_geo(q, "eef", htm)
-    p_eef = htm_eef[0:3, 3]
-    x_eef = htm_eef[0:3, 0]
-    y_eef = htm_eef[0:3, 1]
-    z_eef = htm_eef[0:3, 2]
-
-    r = np.matrix(np.zeros((6,1)))
-    r[0:3,0] = p_eef - p_des
-    r[3] = max(1 - x_des.T @ x_eef, 0)
-    r[4] = max(1 - y_des.T @ y_eef, 0)
-    r[5] = max(1 - z_des.T @ z_eef, 0)
-
-    n = 6
-    jac_r = np.matrix(np.zeros((6, n)))
-    jac_r[0:3, :] = jac_eef[0:3, :]
-    jac_r[3, :] = x_des.T @ Utils.S(x_eef) @ jac_eef[3:6, :]
-    jac_r[4, :] = y_des.T @ Utils.S(y_eef) @ jac_eef[3:6, :]
-    jac_r[5, :] = z_des.T @ Utils.S(z_eef) @ jac_eef[3:6, :]
-
-    return r, jac_r
 joint_handles, _ = sim._get_joint_handles()
-q = sim.get_config()
+q = sim.get_config(joint_handles)[:-1]
+q_map = np.array(-q.copy() - rob.q.copy())
+q = -q - q_map
+
+jac_eef, htm_eef = rob.jac_geo(axis='eef', q=q)
+htm_des = np.matrix(sim.get_target_htm('/xx'))
+# htm_des = htm_eef * Utils.trn([0, 0.5, -0.2])
+# htm_des = np.array([[-0.15302 , -0.496994,  0.854156, -0.102123],
+#        [-0.843845, -0.384117, -0.374672, -0.187982],
+#        [ 0.514305, -0.778108, -0.360609, -0.095886],
+#        [ 0.      ,  0.      ,  0.      ,  1.      ]])
+_, htms = rob.jac_geo(axis='dh')
 
 n = len(htms)
-Kt = 0.5
+Kt = 2
 xi = 1
 q_hist, qdot_hist, r_hist = [], [], []
 sim.sim.startSimulation()
 print('Program started')
 time.sleep(0.1)
-with open('inputs.pickle', 'rb') as f:
-    u = pickle.load(f)
 
-for i in range(imax):
-    q = sim.get_config(joint_handles)
+i=0
+
+def evaluate_error(r, tol_pos=5e-3, tol_ori=5):
+    error_pos = max(abs(r[0:3]))[0, 0]
+    if r.shape[0] == 6:
+        error_ori = (180 / np.pi) * max(abs(np.arccos(1 - r[3:6])))[0, 0]
+    else:
+        error_ori = 0
+    ok1 = error_pos < tol_pos
+    ok2 = error_ori < tol_ori if len(r.tolist()) > 3 else True
+
+    return bool(ok1 and ok2), error_pos, error_ori
+
+converged = False
+
+while (not converged) and (i < imax):
+    q = -sim.get_config(joint_handles)[:-1] - q_map
+    qdot_max = rob.joint_limit[:, 1] - q.reshape(-1, 1)
+    qdot_min = -(rob.joint_limit[:, 0] - q.reshape(-1, 1))
 
     if i % 50 == 0 or i == imax - 1:
         sys.stdout.write('\r')
         sys.stdout.write("[%-20s] %d%%" % ('=' * round(20 * i / (imax - 1)), round(100 * i / (imax - 1))))
         sys.stdout.flush()
 
+    r, jac_r = rob.task_function(np.matrix(htm_des), q=q.astype(float))
+    # r = r[:3]
+    # jac_r = jac_r[:3, :]
     
-    qdot = np.array([.1, .02, .03, .04, .05, .06]).reshape(n, 1)
+    H = 2 * (jac_r.T * jac_r) + eps * np.identity(n)
+    f = 2*(Kt * r.T @ jac_r).T
+    
+    A = np.block([[np.identity(n)], [-np.identity(n)]])
+    b = np.block([[xi * qdot_max ], [-xi * qdot_min]])
 
-    for idx, handle in enumerate(joint_handles):
-        sim.sim.setJointTargetVelocity(handle, qdot[idx][0])
+    try:
+        qdot = solvers.qp(matrix(H), matrix(f))['x']#, matrix(A), matrix(b))['x']
+    except:
+        qdot = np.matrix(np.zeros((n, 1)))
+        error_qp = True
+
+    # qdot = -Kt*np.array(Utils.dp_inv(jac_r, 0.002) @ (r)).reshape(n, 1)
+    qdot = np.array(qdot).reshape(n, 1)
+    # qdot = np.array([0.3,0.3,0.3,0.3,0.3,]).reshape(n, 1)
+
+    for idx, handle in enumerate(joint_handles[:-1]):
+        # if i < 100:
+        #     sim.sim.setJointTargetVelocity(handle, u[i%11][idx])
+        # else:
+        #     sim.sim.setJointTargetVelocity(handle, 0)
+        sim.sim.setJointTargetVelocity(handle, -qdot[idx][0])
+        # if idx in [0, 1, 2, 3, 4, 5]:
+            # sim.sim.setJointTargetVelocity(handle, 0.3)
+        # else:
+        #     sim.sim.setJointTargetVelocity(handle, 0)
     
+    q = (q + qdot*dt).astype(float)
     q_hist.append(q)
     qdot_hist.append(qdot)
-    # sim.client.step()
+    r_hist.append(r)
+    rob.add_ani_frame(i * dt, q)
+    # print(sim.sim.getSimulationTime())
+    sim.client.step()
+    i += 1
+    converged, *_ = evaluate_error(r, tol_pos=1e-3, tol_ori=2)
 
-for idx, handle in enumerate(joint_handles):
-        sim.sim.setJointTargetVelocity(handle, 0)
-print(sim.sim.getObjectPosition(joint_handles[-1], sim.sim.handle_world))
-print(sim.sim.getObjectMatrix(joint_handles[-1], sim.sim.handle_world))
-print(sim.sim.getObjectPose(joint_handles[-1], sim.sim.handle_world))
 sim.sim.pauseSimulation()
-input()
-sim.sim.stopSimulation()
-
-print('Program ended')
-fig=px.line(np.array(q_hist).reshape(-1, 6))
-fig.show()
-fig=px.line(np.array(qdot_hist).reshape(-1, 6))
-fig.show()
-# fig=px.line(np.array(r_hist).reshape(-1, 6))
-# fig.show()
 
 # [0.03306747227907181, 0.23839274048805237, 0.8409093618392944]
 # [-0.7882683277130127, -0.12436030805110931, -0.6026344299316406, 0.033067476004362106, -0.42973530292510986, 0.8122178316116333, 0.3944994807243347, 0.2383929342031479, 0.4404103755950928, 0.5699445605278015, -0.6936875581741333, 0.8409093618392944]
 # [0.03306744620203972, 0.23839303851127625, 0.8409093618392944, 0.15264460444450378, -0.9074929356575012, -0.2656891345977783, 0.2873423993587494]
+#%%
+sim.sim.stopSimulation()
+
+ubsim = Simulation.create_sim_grid([rob])
+frame_des = Frame(name='htm_des', htm=htm_des)
+ubsim.add(frame_des)
+ubsim.run()
 #%%
 """
 
